@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 title Arabic PDF Tools (PowerPoint + Word) - by Beedo El-Omda
 echo.
-echo  Installing Arabic PDF Tools 1.3: "PDF to PPTX" and "PDF to Word"
+echo  Installing Arabic PDF Tools 1.3.1: "PDF to PPTX" and "PDF to Word"
 echo  by Beedo El-Omda
 echo.
 

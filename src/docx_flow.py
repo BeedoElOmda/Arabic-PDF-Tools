@@ -131,6 +131,38 @@ def _container(g, rects):
     return best[1] if best else None
 
 
+def _place_spaces(gs):
+    """Some PDFs store a space glyph stretched back over the letter before it, so
+    sorting by right edge puts it one letter too early. A space that clearly lies
+    over the gap between two letters is moved into that gap."""
+    solid = [g for g in gs if g["t"].strip()]
+    if len(solid) < 2 or len(solid) == len(gs):
+        return gs
+    after = {}
+    for g in gs:
+        if g["t"].strip():
+            continue
+        w = g["x1"] - g["x0"]
+        best, score = None, max(0.2 * w, 0.2 * g["size"])
+        for i in range(len(solid) - 1):
+            a, b = solid[i], solid[i + 1]          # a is right of b
+            ov = min(g["x1"], a["x0"]) - max(g["x0"], b["x1"])
+            if ov > score:
+                best, score = i, ov
+        if best is not None:
+            after[id(g)] = id(solid[best])
+    if not after:
+        return gs
+    moved = set(after)
+    out = []
+    for g in gs:
+        if id(g) in moved:
+            continue
+        out.append(g)
+        out.extend(s for s in gs if after.get(id(s)) == id(g))
+    return out
+
+
 def build_lines(glyphs, rects=(), split_gap=4.0):
     """Group glyphs into visual lines by baseline, split at big horizontal gaps
     and where a line crosses from one drawn box / column / cell into another."""
@@ -169,7 +201,7 @@ def build_lines(glyphs, rects=(), split_gap=4.0):
     rows = merged
     lines = []
     for r in rows:
-        gs = sorted(r["g"], key=lambda g: (-g["x1"], -g["x"]))
+        gs = _place_spaces(sorted(r["g"], key=lambda g: (-g["x1"], -g["x"])))
         if rects:
             for g in gs:
                 g["box"] = _container(g, rects)
@@ -321,8 +353,9 @@ def make_line(gs, row):
     text = "".join(r[0] for r in runs)
     main = max((g["size"] for g in gs), default=row["size"])
     bad = sum(1 for g in gs if g.get("bad") and g["t"].strip()) > 0.5 * max(1, sum(1 for g in gs if g["t"].strip()))
+    ink = [g for g in gs if g["t"].strip()] or gs     # trailing spaces don't widen the line
     return {"runs": runs, "text": re.sub(r"\s+", " ", text).strip(), "rtl": rtl, "bad": bad,
-            "x0": min(g["x0"] for g in gs), "x1": max(g["x1"] for g in gs),
+            "x0": min(g["x0"] for g in ink), "x1": max(g["x1"] for g in ink),
             "y": row["y"], "top": min(g["y0"] for g in gs), "bottom": max(g["y1"] for g in gs),
             "size": main}
 

@@ -182,6 +182,50 @@ def shape_rects(page):
     return rects
 
 
+def image_rects(src_doc, pno):
+    """Boxes that are part of a picture (slides exported with framed text boxes
+    drawn as images): flat, nearly rectangular areas of the text-free page."""
+    try:
+        import numpy as np
+        import cv2
+        import pymupdf
+    except Exception:
+        return []
+    tmp = pymupdf.open()
+    tmp.insert_pdf(src_doc, from_page=pno, to_page=pno)
+    p = tmp[0]
+    for b in p.get_text("dict", flags=0)["blocks"]:
+        if b.get("type") == 0:
+            for l in b["lines"]:
+                for s in l["spans"]:
+                    p.add_redact_annot(pymupdf.Rect(s["bbox"]))
+    p.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                       graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                       text=pymupdf.PDF_REDACT_TEXT_REMOVE)
+    zoom = 1.5
+    pix = p.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+    a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3].astype(np.int16)
+    T = 22
+    dx = np.abs(np.diff(a, axis=1)).max(axis=2) > T
+    dy = np.abs(np.diff(a, axis=0)).max(axis=2) > T
+    edge = np.zeros(a.shape[:2], bool)
+    edge[:, 1:] |= dx
+    edge[:, :-1] |= dx
+    edge[1:, :] |= dy
+    edge[:-1, :] |= dy
+    n, _, stats, _ = cv2.connectedComponentsWithStats((~edge).astype(np.uint8), connectivity=4)
+    H, W = edge.shape
+    out = []
+    for i in range(1, n):
+        x, y, w, h, area = (int(v) for v in stats[i])
+        if w < 30 * zoom or h < 14 * zoom or w * h > 0.8 * W * H:
+            continue
+        if area < 0.72 * w * h:          # not a box: photo, gradient, irregular area
+            continue
+        out.append((x / zoom, y / zoom, (x + w) / zoom, (y + h) / zoom))
+    return out
+
+
 def container_of(row, rects):
     x0, y0, x1, y1 = row["bbox"]
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
@@ -300,6 +344,7 @@ def add_box(slide, box, k):
     """One editable text box per paragraph group. k = EMU per PDF point."""
     from pptx.util import Emu, Pt
     from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+    from pptx.oxml.ns import qn
 
     rows, rtl = box["rows"], box["rtl"]
     x0, x1, y0, y1 = box["x0"], box["x1"], box["y0"], box["y1"]
@@ -334,39 +379,41 @@ def add_box(slide, box, k):
     if cur:
         paras.append(cur)
 
-    # ---- font scale so the reflowed text needs the same room as the original
-    orig = sum(r["bbox"][2] - r["bbox"][0] for r in rows)
-    meas = 0
-    for r in rows:
-        m = text_width("".join(t for _, t in _row_text(r)), r["size"])
-        if m is None:
-            meas = 0
-            break
-        meas += m
-    scale = 1.0
-    # multi-line boxes reflow, so leave extra room to avoid an extra line
-    target = 0.97 if len(rows) == 1 else 0.93
-    if meas and meas > orig * target:
-        scale = max(0.6, orig * target / meas)
-
-    # ---- geometry: multi-line boxes keep the column width; single lines get
-    #      spare room on the side the text grows towards
+    # ---- geometry: the box covers the original lines (plus a little room),
+    #      never spilling out of the frame the text sits in
     if len(rows) == 1:
         slack = W * 0.12 + 6
         if centred or align == PP_ALIGN.CENTER:
-            left, width = x0 - slack / 2, W + slack
+            left, right = x0 - slack / 2, x1 + slack / 2
         elif rtl:
-            left, width = x0 - slack, W + slack
+            left, right = x0 - slack, x1
         else:
-            left, width = x0, W + slack
+            left, right = x0, x1 + slack
     else:
         pad = W * 0.015 + 2
-        left, width = x0 - pad, W + 2 * pad
+        left, right = x0 - pad, x1 + pad
+    frame = box.get("box")
+    if frame:
+        left, right = max(left, frame[0] + 1), min(right, frame[2] - 1)
+        if right - left < W:                       # keep at least the text's own width
+            left, right = x0, x1
     left = max(0, left)
+    width = right - left
+
+    # ---- every original line keeps its own line, so the font is scaled until
+    #      the widest line fits the box (no extra wrapping, nothing overflows)
+    scale = 1.0
+    room = width * 0.97
+    for r in rows:
+        m = text_width("".join(t for _, t in _row_text(r)), r["size"])
+        if m and m > room:
+            scale = min(scale, room / m)
+    scale = max(0.6, scale)
+
     tb = slide.shapes.add_textbox(Emu(int(left * k)), Emu(int(y0 * k)),
                                   Emu(int(width * k)), Emu(int((y1 - y0) * k)))
     tf = tb.text_frame
-    tf.word_wrap = True
+    tf.word_wrap = len(rows) > 1      # a single line never wraps (e.g. "1 / 44")
     tf.auto_size = None
     tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
     tf.vertical_anchor = MSO_ANCHOR.TOP if len(rows) > 1 else MSO_ANCHOR.MIDDLE
@@ -389,11 +436,21 @@ def add_box(slide, box, k):
         for j, r in enumerate(para):
             parts = _row_text(r)
             if j > 0:
-                # join wrapped lines with a space (unless one is already there)
+                # keep the original line break, so each line stays where it was
+                p.add_line_break()
+                br = p._p.findall(qn("a:br"))[-1]
+                rpr = br.makeelement(qn("a:rPr"), {"sz": str(int(Pt(max(6, round(r["size"] * scale * k / 12700 * 2) / 2)).pt * 100))})
+                if rtl:
+                    rpr.set("lang", "ar-EG")
+                br.append(rpr)
+            if parts:
                 s0, t0 = parts[0]
-                if not t0.startswith(" "):
-                    parts[0] = (s0, " " + t0)
+                parts[0] = (s0, t0.lstrip(" "))
+                s1, t1 = parts[-1]
+                parts[-1] = (s1, t1.rstrip(" "))
             for s, t in parts:
+                if not t:
+                    continue
                 run = p.add_run()
                 run.text = t
                 _style_run(run, s, scale, k, rtl)
@@ -424,6 +481,10 @@ def convert(pdf_path, image_only=False):
             slide.shapes.add_picture(io.BytesIO(img), 0, 0, prs.slide_width, prs.slide_height)
             continue
         rects = shape_rects(page)
+        try:
+            rects += image_rects(doc, pno)       # framed boxes that are part of a picture
+        except Exception:
+            pass
         rows, keep = engine_rows(page, rects, expand)
         boxes = group_boxes(rows, rects)
         bg = background_png(doc, pno, keep)
