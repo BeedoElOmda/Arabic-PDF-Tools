@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 title Arabic PDF Tools (PowerPoint + Word) - by Beedo El-Omda
 echo.
-echo  Installing Arabic PDF Tools 1.3.2: "PDF to PPTX" and "PDF to Word"
+echo  Installing Arabic PDF Tools 1.3.3: "PDF to PPTX" and "PDF to Word"
 echo  by Beedo El-Omda
 echo.
 
@@ -43,6 +43,7 @@ copy /y "%~dp0pdf2pptx.py" "%APPDIR%\pdf2pptx.py" >nul
 copy /y "%~dp0fix_arabic_pdf.py" "%APPDIR%\fix_arabic_pdf.py" >nul
 copy /y "%~dp0pdf2docx_arabic.py" "%APPDIR%\pdf2docx_arabic.py" >nul
 copy /y "%~dp0docx_flow.py" "%APPDIR%\docx_flow.py" >nul
+copy /y "%~dp0arabic_common_words.py" "%APPDIR%\arabic_common_words.py" >nul
 copy /y "%~dp0Uninstall.cmd" "%APPDIR%\Uninstall.cmd" >nul
 del "%SENDTO%\PDF to PPTX (Arabic-safe).lnk" 2>nul
 

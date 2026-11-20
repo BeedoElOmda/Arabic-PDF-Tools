@@ -57,24 +57,32 @@ ARABIC = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
 def repaired_for_text(path):
     """(PDF bytes, expand function, font coverage) using the shared Arabic text engine."""
     import pikepdf
-    from fix_arabic_pdf import fix_font, expand_ligatures
+    from fix_arabic_pdf import fix_font, expand_ligatures, fill_missing_codes, UNKNOWN_GUESSES, DOT_PLACEHOLDERS
 
     pdf = pikepdf.open(path)
     seen, ligs, coverage = set(), {}, {}
+    UNKNOWN_GUESSES.clear()
+    DOT_PLACEHOLDERS.clear()
+    fill_missing_codes(pdf, ligs)
     for obj in pdf.objects:
         if isinstance(obj, pikepdf.Dictionary) and obj.get("/Type") == "/Font":
             fix_font(obj, seen, ligs, coverage)
     buf = io.BytesIO()
     pdf.save(buf)
-    return buf.getvalue(), (lambda c: expand_ligatures(c, ligs)), coverage
+    guesses = {v: UNKNOWN_GUESSES.get(v, []) for k, v in ligs.items() if k.startswith("\x00")}
+    return buf.getvalue(), (lambda c: expand_ligatures(c, ligs)), coverage, guesses
 
 
-def engine_rows(page, rects, expand):
+def engine_lines(page, rects, expand):
+    import docx_flow
+    return docx_flow.build_lines(docx_flow.page_glyphs(page, expand), rects, split_gap=1.2)
+
+
+def engine_rows(lines):
     """Rows for the slide builder, from the shared text engine (correct order,
     repaired letters, no kashida, spaces fixed). Returns (rows, unreadable bboxes)."""
-    import docx_flow
     rows, keep = [], []
-    for ln in docx_flow.build_lines(docx_flow.page_glyphs(page, expand), rects, split_gap=1.2):
+    for ln in lines:
         bbox = (ln["x0"], ln["top"], ln["x1"], ln["bottom"])
         if ln.get("bad"):
             keep.append(bbox)          # unreliable font: leave it in the picture
@@ -93,9 +101,10 @@ def engine_rows(page, rects, expand):
 def repaired_pdf_bytes(path):
     """Return PDF bytes with Arabic letter maps repaired (see fix_arabic_pdf.py)."""
     import pikepdf
-    from fix_arabic_pdf import fix_font
+    from fix_arabic_pdf import fix_font, fill_missing_codes
 
     pdf = pikepdf.open(path)
+    fill_missing_codes(pdf)
     seen = set()
     for obj in pdf.objects:
         if isinstance(obj, pikepdf.Dictionary) and obj.get("/Type") == "/Font":
@@ -472,7 +481,7 @@ def convert(pdf_path, image_only=False):
     from pptx.util import Emu
 
     import docx_flow
-    data, expand, coverage = repaired_for_text(pdf_path)
+    data, expand, coverage, guesses = repaired_for_text(pdf_path)
     doc = pymupdf.open(stream=data, filetype="pdf")
     docx_flow.learn_font_names(doc)
     docx_flow._UNREADABLE.clear()
@@ -484,18 +493,29 @@ def convert(pdf_path, image_only=False):
     k = 12192000 / first.width
     blank = prs.slide_layouts[6]
 
+    # first pass: text lines of every page, so letters the PDF lost and doubtful
+    # spaces can be settled with the whole document's vocabulary
+    page_rects, page_lines = [], []
+    if not image_only:
+        for pno, page in enumerate(doc):
+            rects = shape_rects(page)
+            try:
+                rects += image_rects(doc, pno)       # framed boxes that are part of a picture
+            except Exception:
+                pass
+            page_rects.append(rects)
+            page_lines.append(engine_lines(page, rects, expand))
+        docx_flow.resolve_unknowns(page_lines, guesses)
+        docx_flow.resolve_doubtful_spaces(page_lines)
+
     for pno, page in enumerate(doc):
         slide = prs.slides.add_slide(blank)
         if image_only:
             img = page.get_pixmap(dpi=DPI).tobytes("png")
             slide.shapes.add_picture(io.BytesIO(img), 0, 0, prs.slide_width, prs.slide_height)
             continue
-        rects = shape_rects(page)
-        try:
-            rects += image_rects(doc, pno)       # framed boxes that are part of a picture
-        except Exception:
-            pass
-        rows, keep = engine_rows(page, rects, expand)
+        rects = page_rects[pno]
+        rows, keep = engine_rows(page_lines[pno])
         boxes = group_boxes(rows, rects)
         bg = background_png(doc, pno, keep)
         slide.shapes.add_picture(io.BytesIO(bg), 0, 0, prs.slide_width, prs.slide_height)

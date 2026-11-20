@@ -433,6 +433,7 @@ def cid_font_texts(font, suspicious, all_codes=()):
 
 
 UNKNOWN_GUESSES = {}   # placeholder char -> [(letter, shape score), ...]
+DOT_PLACEHOLDERS = set()   # placeholders of zero-width pieces (dots drawn separately)
 
 
 def _next_pua(codes):
@@ -513,8 +514,279 @@ def expand_ligatures(text, ligature_codes):
     return "".join(back.get(c, c) for c in text)
 
 
+# ------------------------------------------- codes missing from ToUnicode ---
+def _font_program(font):
+    """(TTFont, code -> glyph name function, is_simple) for fonts with an embedded
+    TrueType program, else None."""
+    import io
+    from fontTools.ttLib import TTFont
+    st = font.get("/Subtype")
+    if st == "/Type0":
+        if str(font.get("/Encoding")) not in ("/Identity-H", "/Identity-V"):
+            return None
+        df = font.DescendantFonts[0]
+        ff = df.FontDescriptor.get("/FontFile2")
+        if ff is None:
+            return None
+        tt = TTFont(io.BytesIO(ff.read_bytes()), lazy=False)
+        order = tt.getGlyphOrder()
+        c2g = df.get("/CIDToGIDMap")
+        cid2gid = None
+        if c2g is not None and str(c2g) != "/Identity":
+            data = c2g.read_bytes()
+            cid2gid = [data[2 * c] << 8 | data[2 * c + 1] for c in range(len(data) // 2)]
+
+        def name(code):
+            g = code if cid2gid is None else (cid2gid[code] if code < len(cid2gid) else None)
+            return order[g] if g is not None and 0 < g < len(order) else None
+        return tt, name, False
+    if st == "/TrueType":
+        fd = font.get("/FontDescriptor")
+        ff = fd.get("/FontFile2") if fd is not None else None
+        if ff is None:
+            return None
+        tt = TTFont(io.BytesIO(ff.read_bytes()), lazy=False)
+        tables = {(t.platformID, t.platEncID): t.cmap for t in tt["cmap"].tables} if "cmap" in tt else {}
+
+        def name(code):
+            for key, off in (((3, 0), 0xF000), ((1, 0), 0), ((3, 1), 0), ((3, 0), 0)):
+                m = tables.get(key)
+                if m and code + off in m:
+                    return m[code + off]
+            return None
+        return tt, name, True
+    return None
+
+
+def _good_text(v):
+    return bool(v.strip()) and not any(0xE000 <= ord(c) <= 0xF8FF or c == "\ufffd" for c in v)
+
+
+_REF = {}
+
+
+def _ref_raster(ch, n=40):
+    """Raster of a Latin character in a standard font (Helvetica), for checking
+    whether a glyph really is the character its encoding claims."""
+    if ch not in _REF:
+        r = None
+        try:
+            import numpy as np
+            import pymupdf
+            from PIL import Image
+            d = pymupdf.open()
+            p = d.new_page(width=80, height=80)
+            p.insert_text((15, 60), ch, fontsize=48, fontname="helv")
+            pix = p.get_pixmap(alpha=False)
+            a = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, 0] < 128
+            ys, xs = np.nonzero(a)
+            if len(xs):
+                c = a[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+                r = np.array(Image.fromarray(c.astype(np.uint8) * 255).resize((n, n))) > 127
+        except Exception:
+            r = None
+        _REF[ch] = r
+    return _REF[ch]
+
+
+def _looks_like(gs, gname, ch):
+    r, R = _raster(gs, gname), _ref_raster(ch)
+    if r is None or R is None or not r.sum():
+        return False
+    return (r & R).sum() / (r | R).sum() >= 0.5
+
+
+def _map_bare_font(pdf, obj, lib, arabic_names, ligature_codes):
+    """A simple TrueType font without any ToUnicode map, from a family that
+    carries Arabic elsewhere in the document (macOS exports split an Arabic
+    font into a mapped part and an unmapped MacRoman part). Build its map."""
+    if str(obj.get("/BaseFont", "")).split("+")[-1] not in arabic_names:
+        return 0
+    prog = _font_program(obj)
+    if prog is None:
+        return 0
+    tt, name, _ = prog
+    gs = tt.getGlyphSet()
+    order = tt.getGlyphOrder()
+    first = int(obj.get("/FirstChar", 0))
+    used = [first + i for i in range(len(obj.get("/Widths", [])))]
+    enc = "mac_roman" if str(obj.get("/Encoding", "")) == "/MacRomanEncoding" else "cp1252"
+    mapping, unresolved = {}, []
+    for c in used:
+        n = name(c)
+        if not n or n == ".notdef":
+            continue
+        if not re.fullmatch(r"glyph\d+|g\d+|gid\d+", n):
+            # a real glyph name (zero, comma, uni0628...) says what it is
+            t = glyph_text(n)
+            if not t:
+                try:
+                    t = bytes([c]).decode(enc)
+                except Exception:
+                    t = ""
+            if t:
+                mapping[format(c, "02X")] = t
+                continue
+        key = outline_key(gs, n)
+        cand = lib.get(key) if key is not None else None
+        if cand:
+            mapping[format(c, "02X")] = max(cand.items(), key=lambda x: x[1])[0]
+            continue
+        try:
+            ch = bytes([c]).decode(enc)
+        except Exception:
+            ch = ""
+        if not ch.strip() or n in ("space", ".notdef") or _looks_like(gs, n, ch):
+            mapping[format(c, "02X")] = ch or " "
+        else:
+            unresolved.append((c, n))
+    if not any(ARABIC_CH.search(v) for v in mapping.values()) and not unresolved:
+        return 0
+    if unresolved:
+        gidx = {n: i for i, n in enumerate(order)}
+        gtext = {gidx[name(int(k, 16))]: v for k, v in mapping.items()
+                 if name(int(k, 16)) in gidx and ARABIC_CH.search(v)}
+        sure, guesses = {}, {}
+        try:
+            sure, guesses = match_by_shape(tt, [gidx[n] for _, n in unresolved if n in gidx], gtext)
+        except Exception:
+            pass
+        zero = {first + i for i, w in enumerate(obj.get("/Widths", [])) if float(w) == 0}
+        for c, n in unresolved:
+            code = format(c, "02X")
+            g = gidx.get(n)
+            if c in zero and ligature_codes is None:
+                mapping[code] = "\u200b"
+            elif g in sure and c not in zero:
+                mapping[code] = sure[g]
+            elif ligature_codes is not None:
+                ok = outline_key(gs, n)    # same glyph in another subset -> same placeholder
+                key = "\x00?" + (("o%d" % ok) if ok is not None else str(obj.get("/BaseFont", "")) + ":" + code)
+                if key not in ligature_codes:
+                    ligature_codes[key] = _next_pua(ligature_codes)
+                    UNKNOWN_GUESSES[ligature_codes[key]] = guesses.get(g, [])
+                if c in zero:
+                    DOT_PLACEHOLDERS.add(ligature_codes[key])
+                mapping[code] = ligature_codes[key]
+            else:
+                mapping[code] = "\u200b"          # unknown: better nothing than junk
+    obj.ToUnicode = pdf.make_stream(build_cmap("<00> <FF>", mapping))
+    return len(mapping)
+
+
+def fill_missing_codes(pdf, ligature_codes=None):
+    """Some PDFs (e.g. macOS / Keynote exports) leave glyphs out of a font's
+    ToUnicode map, so text extraction shows Latin junk (%, N, Z, W ...) instead
+    of Arabic letters. The same glyph outline is usually mapped in another
+    subset of the font elsewhere in the document; failing that, its shape is
+    compared with the letters this font does map. Missing codes are added."""
+    fonts, bare = [], []
+    lib = {}
+    done = set()
+    for obj in pdf.objects:
+        if not isinstance(obj, pikepdf.Dictionary) or obj.get("/Type") != "/Font":
+            continue
+        tu = obj.get("/ToUnicode")
+        if tu is None:
+            if obj.get("/Subtype") == "/TrueType" and obj.objgen not in done:
+                done.add(obj.objgen)
+                bare.append(obj)
+            continue
+        if tu.objgen in done:
+            continue
+        done.add(tu.objgen)
+        try:
+            prog = _font_program(obj)
+            if prog is None:
+                continue
+            codespace, mapping = parse_cmap(tu.read_bytes().decode("latin-1"))
+        except Exception:
+            continue
+        tt, name, simple = prog
+        gs = tt.getGlyphSet()
+        for k, v in mapping.items():
+            n = name(int(k, 16))
+            if n and _good_text(v):
+                key = outline_key(gs, n)
+                if key is not None:
+                    lib.setdefault(key, {}).setdefault(norm(v), 0)
+                    lib[key][norm(v)] += 1
+        fonts.append((obj, tu, prog, codespace, mapping))
+    added = 0
+    arabic_names = {str(o.get("/BaseFont", "")).split("+")[-1] for o, _, _, _, m in fonts
+                    if any(ARABIC_CH.search(v) for v in m.values())}
+    for obj in bare:
+        try:
+            added += _map_bare_font(pdf, obj, lib, arabic_names, ligature_codes)
+        except Exception:
+            pass
+    for obj, tu, (tt, name, simple), codespace, mapping in fonts:
+        if not any(ARABIC_CH.search(v) for v in mapping.values()):
+            continue
+        if simple:
+            first = int(obj.get("/FirstChar", 0))
+            widths = list(obj.get("/Widths", []))
+            used = [first + i for i in range(len(widths))]     # zero-width parts too
+            width = 2
+        else:
+            used = []
+            width = 4
+        have = {int(k, 16) for k in mapping}
+        missing = [c for c in used if c not in have and name(c) not in (None, ".notdef")]
+        if not missing:
+            continue
+        gs = tt.getGlyphSet()
+        order = tt.getGlyphOrder()
+        new = dict(mapping)
+        unresolved = []
+        for c in missing:
+            n = name(c)
+            key = outline_key(gs, n)
+            cand = lib.get(key) if key is not None else None
+            if cand:
+                new[format(c, "0%dX" % width)] = max(cand.items(), key=lambda x: x[1])[0]
+            elif n not in (".notdef", "space"):
+                unresolved.append((c, n))
+        if unresolved:
+            sure, guesses, gidx = {}, {}, {}
+            try:
+                gidx = {n: i for i, n in enumerate(order)}
+                gtext = {}
+                for k, v in mapping.items():
+                    n = name(int(k, 16))
+                    if n in gidx and _good_text(v):
+                        gtext[gidx[n]] = v
+                sure, guesses = match_by_shape(tt, [gidx[n] for _, n in unresolved if n in gidx], gtext)
+            except Exception:
+                pass
+            zero = {first + i for i, w in enumerate(widths) if float(w) == 0} if simple else set()
+            for c, n in unresolved:
+                code = format(c, "0%dX" % width)
+                g = gidx.get(n)
+                if c in zero and ligature_codes is None:
+                    new[code] = "\u200b"           # dots/marks drawn as separate zero-width pieces
+                elif g in sure and c not in zero:
+                    new[code] = sure[g]
+                elif ligature_codes is not None:
+                    # unknown glyph (letter or ligature): a placeholder that the
+                    # document's own words resolve later
+                    ok = outline_key(gs, n)
+                    key = "\x00?" + (("o%d" % ok) if ok is not None else str(obj.get("/BaseFont", "")) + ":" + code)
+                    if key not in ligature_codes:
+                        ligature_codes[key] = _next_pua(ligature_codes)
+                        UNKNOWN_GUESSES[ligature_codes[key]] = guesses.get(g, [])
+                    if c in zero:
+                        DOT_PLACEHOLDERS.add(ligature_codes[key])
+                    new[code] = ligature_codes[key]
+        if len(new) > len(mapping):
+            added += len(new) - len(mapping)
+            tu.write(build_cmap(codespace, new))
+    return added
+
+
 def fix_pdf(path):
     pdf = pikepdf.open(path)
+    fill_missing_codes(pdf)
     fixed_fonts = changed_codes = 0
     seen = set()
     for obj in pdf.objects:

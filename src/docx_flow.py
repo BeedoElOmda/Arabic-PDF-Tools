@@ -94,7 +94,12 @@ def page_glyphs(page, expand):
             continue
     if raw is None:
         return []
+    try:
+        from fix_arabic_pdf import DOT_PLACEHOLDERS as dots
+    except Exception:
+        dots = set()
     glyphs = []
+    seq = 0
     for b in raw["blocks"]:
         if b.get("type") != 0:
             continue
@@ -102,21 +107,47 @@ def page_glyphs(page, expand):
             if abs(l["dir"][1]) > 0.05:          # skip rotated text
                 continue
             for s in l["spans"]:
+                seq += 1
                 fam, bold, italic = font_family(s["font"])
                 bold = bold or bool(s["flags"] & 16)
                 italic = italic or bool(s["flags"] & 2)
                 style = (fam, round(s["size"] * 2) / 2, bold, italic, s["color"])
                 bad = s["font"].split("+")[-1] in _UNREADABLE
                 for c in s["chars"]:
-                    ch = expand(c["c"])
+                    ch = expand(c["c"]).replace("\u200b", "")
                     if not ch:
                         continue
                     x0, y0, x1, y1 = c["bbox"]
                     g = {"t": ch, "x": c["origin"][0], "y": c["origin"][1], "x0": x0, "x1": x1,
-                         "y0": y0, "y1": y1, "size": s["size"], "style": style, "bad": bad}
+                         "y0": y0, "y1": y1, "size": s["size"], "style": style, "bad": bad, "seq": seq}
                     g["mark"] = bool(ch.strip()) and all(unicodedata.combining(k) for k in ch)
+                    g["dot"] = bool(dots) and all(k in dots for k in ch)
                     glyphs.append(g)
+    if dots:
+        glyphs = _attach_dots(glyphs)
     return glyphs
+
+
+def _attach_dots(glyphs):
+    """Dots some PDFs draw as separate zero-width pieces join the letter they sit
+    on (found by position), so the pair can be read as one letter later."""
+    bases = [g for g in glyphs if not g.get("dot")]
+    for d in glyphs:
+        if not d.get("dot"):
+            continue
+        best, score = None, None
+        for b in bases:
+            if not b["t"].strip() or abs(b["y"] - d["y"]) > 1.2 * b["size"]:
+                continue
+            dist = 0 if b["x0"] - 0.5 <= d["x"] <= b["x1"] + 0.5 else min(abs(d["x"] - b["x0"]), abs(d["x"] - b["x1"]))
+            if dist > 0.3 * b["size"]:
+                continue
+            sc = (dist, abs(b["y"] - d["y"]))
+            if score is None or sc < score:
+                best, score = b, sc
+        if best is not None:
+            best["t"] += d["t"]
+    return bases
 
 
 # ------------------------------------------------------------- lines ---
@@ -172,6 +203,38 @@ def _place_spaces(gs):
     return out
 
 
+def _drop_hidden_copy(gs):
+    """Some slides hold the same title twice at slightly different sizes, one
+    copy covered by the other. Keep only the copy drawn last (the visible one)."""
+    groups = {}
+    for g in gs:
+        groups.setdefault(round(g["size"], 1), []).append(g)
+    if len(groups) < 2:
+        return gs
+    import difflib
+    big = sorted((v for v in groups.values() if len(v) >= 4), key=lambda v: -max(g.get("seq", 0) for g in v))
+    drop = set()
+
+    def text(v):        # Arabic letters only, right to left
+        return re.sub("[^\u0621-\u064A]", "", "".join(g["t"] for g in sorted(v, key=lambda g: -g["x1"])))
+    for i, a in enumerate(big):
+        if id(a[0]) in drop:
+            continue
+        ta = text(a)
+        ax0, ax1 = min(g["x0"] for g in a), max(g["x1"] for g in a)
+        for b in big[i + 1:]:
+            tb = text(b)
+            bx0, bx1 = min(g["x0"] for g in b), max(g["x1"] for g in b)
+            ov = min(ax1, bx1) - max(ax0, bx0)
+            short = min(len(ta), len(tb))
+            if short < 4 or ov < 0.6 * min(ax1 - ax0, bx1 - bx0):
+                continue
+            same = sum(m.size for m in difflib.SequenceMatcher(None, ta, tb, autojunk=False).get_matching_blocks())
+            if same >= 0.8 * short and short >= 0.6 * max(len(ta), len(tb)):
+                drop.update(id(g) for g in b)
+    return [g for g in gs if id(g) not in drop] if drop else gs
+
+
 def build_lines(glyphs, rects=(), split_gap=4.0):
     """Group glyphs into visual lines by baseline, split at big horizontal gaps
     and where a line crosses from one drawn box / column / cell into another."""
@@ -208,6 +271,8 @@ def build_lines(glyphs, rects=(), split_gap=4.0):
         else:
             merged.append(r)
     rows = merged
+    for r in rows:
+        r["g"] = _drop_hidden_copy(r["g"])
     lines = []
     for r in rows:
         gs = _place_spaces(sorted(r["g"], key=_rtl_key))
@@ -514,57 +579,162 @@ LETTERS = "ءآأؤإئابةتثجحخدذرزسشصضطظعغفقكلمنهو�
 def resolve_unknowns(page_lines, guesses):
     """Fill letters the PDF lost, using the document's own vocabulary.
 
-    guesses: {placeholder: [(letter, shape score), ...]}. For each placeholder,
-    every Arabic letter is tried in the words that contain it; the letter that
-    turns them into words found elsewhere in the document wins (shape
-    similarity breaks ties). Placeholders that can't be decided are removed.
+    guesses: {placeholder: [(letter, shape score), ...]}. An unknown token is a
+    run of placeholders inside a word (some PDFs draw one letter as several
+    pieces, or several letters as one). Every word holding unknown tokens is
+    matched against the words that are readable elsewhere in the document; each
+    match votes for what its tokens stand for. The best supported reading of
+    each token is taken, put back into the other words, and the rest voted on
+    again. Tokens that can't be decided are dropped (or set from their shape).
     """
-    present = {ph for ls in page_lines for l in ls for ph in guesses if ph in l["text"]}
-    if not present:
+    phs = "".join(guesses)
+    if not phs:
         return
-    word_re = re.compile("[\u0621-\u064A\u0671-\u06D3%s\u064B-\u065F\u0670]+" % "".join(present))
+    tok_re = re.compile("[%s]+" % re.escape(phs))
+    letters = "\u0621-\u064A"
+    word_re = re.compile("[%s\u0671-\u06D3%s\u064B-\u065F\u0670]+" % (letters, re.escape(phs)))
     vocab = {}
-    words_with = {ph: [] for ph in present}
+    words = {}
     for ls in page_lines:
         for l in ls:
             for w in word_re.findall(l["text"]):
                 w = HARAKAT.sub("", w)
-                hit = [ph for ph in present if ph in w]
-                if hit:
-                    for ph in hit:
-                        words_with[ph].append(w)
-                else:
+                if tok_re.search(w):
+                    words[w] = words.get(w, 0) + 1
+                elif len(w) > 1:
                     vocab[w] = vocab.get(w, 0) + 1
+    if not words:
+        return
+    try:
+        from arabic_common_words import WORDS
+        for i, v in enumerate(WORDS):
+            # the list is roughly in order of frequency: early words count more
+            vocab[v] = max(vocab.get(v, 0), 5000.0 / (i + 10))
+    except Exception:
+        pass
+    by_len = {}
+    for v, n in vocab.items():
+        by_len.setdefault(len(v), []).append((v, n))
     choice = {}
-    for ph in present:
-        prior = dict(guesses.get(ph, []))
-        best, best_score = None, 0.0
-        for L in LETTERS:
-            hits = 0
-            for w in words_with[ph]:
-                cand = w.replace(ph, L)
-                if any(o in cand for o in present):
+
+    def vote_round():
+        votes = {}
+        for w, wn in words.items():
+            parts = tok_re.split(w)
+            toks = tok_re.findall(w)
+            unknown = [t for t in toks if t not in choice]
+            if not unknown:
+                continue
+            for pre in ("", "و", "ف", "ب", "ل", "ك"):
+                if pre and not parts[0].startswith(pre):
                     continue
-                if vocab.get(cand) or vocab.get(cand[1:]) and cand[0] in "وفبلك":
-                    hits += 1
-            score = hits + 0.5 * prior.get(L, 0.0)
-            if score > best_score:
-                best, best_score = L, score
-        if best is not None and best_score >= 1.0:
-            choice[ph] = best
-        elif prior and max(prior.values()) >= 0.5:
-            choice[ph] = max(prior, key=prior.get)
-        else:
-            choice[ph] = ""
+                ps = list(parts)
+                ps[0] = ps[0][len(pre):]
+                rx, fixed = "", sum(len(p) for p in ps)
+                for i, t in enumerate(toks):
+                    rx += re.escape(ps[i])
+                    if t in choice:
+                        rx += re.escape(choice[t])
+                        fixed += len(choice[t])
+                    else:
+                        rx += "([%s]{1,3})" % letters
+                rx += re.escape(ps[-1])
+                cre = re.compile(rx + "$")
+                nunk = sum(1 for t in toks if t not in choice)
+                hits = []
+                for L in range(fixed + nunk, fixed + 3 * nunk + 1):
+                    for v, n in by_len.get(L, ()):
+                        m = cre.match(v)
+                        if m:
+                            hits.append((m.groups(), n))
+                if not hits:
+                    continue
+                # every readable word this one could be gets an equal share of its vote
+                # a reading scores one point for every different word it makes
+                # readable (plus a small share, so frequent words break ties)
+                readings = {}
+                for groups, n in hits:
+                    key = tuple(g.replace("\u0649", "\u064A") for g in groups)
+                    readings[key] = readings.get(key, 0) + n
+                total = sum(readings.values())
+                seen_vals = set()
+                for groups, n in readings.items():
+                    share = 0.5 * n / total           # frequent readings win ties
+                    gi = iter(groups)
+                    for t in toks:
+                        if t not in choice:
+                            val = next(gi)
+                            d = votes.setdefault(t, {})
+                            d[val] = d.get(val, 0.0) + share
+                            if (t, val) not in seen_vals:
+                                seen_vals.add((t, val))
+                                d[val] += 1.0
+                break
+        return votes
+
+    for _ in range(10):
+        votes = vote_round()
+        progress = False
+        # settle the clearest tokens first; the rest are voted on again with them in
+        ranked = []
+        for t, vs in votes.items():
+            best = sorted(vs.items(), key=lambda x: (-round(x[1], 6), len(x[0])))
+            top = best[0][1]
+            second = best[1][1] if len(best) > 1 else 0.0
+            if top >= 2.0 and top >= second + 1.0:
+                ranked.append((top - second, t, best[0][0]))
+        ranked.sort(reverse=True)
+        for _, t, val in ranked[:max(1, len(ranked) // 2)]:
+            choice[t] = val
+            progress = True
+        if not progress:
+            break
+
+    last = vote_round()
+    for t, vs in last.items():
+        if t not in choice:
+            ranked = sorted(vs.items(), key=lambda x: (-round(x[1], 6), len(x[0])))
+            top = ranked[0][1]
+            second = ranked[1][1] if len(ranked) > 1 else 0.0
+            # not clear-cut, but better than a missing letter -- except for a whole
+            # word that could be any common word (then a wrong word is worse)
+            alone = all(re.fullmatch("[وفبلك]?" + re.escape(t), w) for w in words if t in w)
+            if top >= 1.0 and (top - second >= 0.002 or not alone):
+                choice[t] = ranked[0][0]
+    if os.environ.get("ARPDF_DEBUG"):
+        for t, vs in last.items():
+            print("VOTES", repr(t), sorted(vs.items(), key=lambda x: -x[1])[:4])
+
+    def single(t):
+        prior = dict(guesses.get(t, [])) if len(t) == 1 else {}
+        return max(prior, key=prior.get) if prior and max(prior.values()) >= 0.5 else ""
+
+    if os.environ.get("ARPDF_DEBUG"):
+        alltok = {}
+        for w, n in words.items():
+            for t in tok_re.findall(w):
+                alltok[t] = alltok.get(t, 0) + n
+        for t, n in sorted(alltok.items(), key=lambda x: -x[1])[:40]:
+            print(repr(t), n, repr(choice.get(t)), [tok_re.sub("?", w) for w in words if t in w][:5])
+
+    def fix_word(m):
+        w = m.group()
+        if not tok_re.search(w):
+            return w
+        out = tok_re.sub(lambda t: choice[t.group()] if t.group() in choice else single(t.group()), w)
+        if out.endswith("\u064A") and vocab.get(out[:-1] + "\u0649", 0) > vocab.get(out, 0):
+            out = out[:-1] + "\u0649"
+        return out
+
+    def fix(text):
+        return word_re.sub(fix_word, text)
     for ls in page_lines:
         for l in ls:
-            if not any(ph in l["text"] for ph in choice):
+            if not tok_re.search(l["text"]):
                 continue
             for r in l["runs"]:
-                for ph, L in choice.items():
-                    r[0] = r[0].replace(ph, L)
-            for ph, L in choice.items():
-                l["text"] = l["text"].replace(ph, L)
+                r[0] = fix(r[0])
+            l["text"] = fix(l["text"])
     return choice
 
 

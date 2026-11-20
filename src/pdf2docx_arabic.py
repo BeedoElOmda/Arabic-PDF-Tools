@@ -290,10 +290,13 @@ def convert_flow(pdf_path):
     import io
     import pikepdf
     import docx_flow
-    from fix_arabic_pdf import fix_font, expand_ligatures
+    from fix_arabic_pdf import fix_font, expand_ligatures, fill_missing_codes, UNKNOWN_GUESSES, DOT_PLACEHOLDERS
 
     pdf = pikepdf.open(pdf_path)
     seen, ligs, coverage = set(), {}, {}
+    UNKNOWN_GUESSES.clear()
+    DOT_PLACEHOLDERS.clear()
+    fill_missing_codes(pdf, ligs)
     for obj in pdf.objects:
         if isinstance(obj, pikepdf.Dictionary) and obj.get("/Type") == "/Font":
             fix_font(obj, seen, ligs, coverage)
@@ -313,13 +316,14 @@ def convert_layout(pdf_path):
     import pikepdf
     import docx
     from pdf2docx import Converter
-    from fix_arabic_pdf import fix_font
+    from fix_arabic_pdf import fix_font, fill_missing_codes
 
     tmpdir = tempfile.mkdtemp(prefix="pdf2docx_ar_")
     fixed = os.path.join(tmpdir, "fixed.pdf")
     raw = os.path.join(tmpdir, "raw.docx")
 
     pdf = pikepdf.open(pdf_path)
+    fill_missing_codes(pdf)
     seen = set()
     for obj in pdf.objects:
         if isinstance(obj, pikepdf.Dictionary) and obj.get("/Type") == "/Font":
