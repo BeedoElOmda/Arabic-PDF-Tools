@@ -1,4 +1,4 @@
-Arabic PDF Tools 1.3.1 - PDF to PowerPoint / PDF to Word (editable, correct Arabic)
+Arabic PDF Tools 1.3.2 - PDF to PowerPoint / PDF to Word (editable, correct Arabic)
 by Beedo El-Omda
 ============================================================================
 1. Unzip this folder anywhere (e.g. Downloads).

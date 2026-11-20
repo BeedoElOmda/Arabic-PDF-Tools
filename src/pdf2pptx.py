@@ -358,9 +358,10 @@ def add_box(slide, box, k):
     justified = len(rows) > 2 and len(full) >= 0.6 * (len(rows) - 1)
     if centred:
         align = PP_ALIGN.CENTER
-    elif justified:
-        align = PP_ALIGN.JUSTIFY
     else:
+        # justified text is set flush right (left for English): every original
+        # line keeps its own break, and PowerPoint would stretch the spaces of
+        # a justified line ending in a break into wide gaps between words
         align = PP_ALIGN.RIGHT if rtl else PP_ALIGN.LEFT
 
     # ---- split rows into paragraphs: a row that ends early ends its paragraph
@@ -448,6 +449,15 @@ def add_box(slide, box, k):
                 parts[0] = (s0, t0.lstrip(" "))
                 s1, t1 = parts[-1]
                 parts[-1] = (s1, t1.rstrip(" "))
+            clean, prev_space = [], False
+            for s, t in parts:
+                t = re.sub(r"\s{2,}", " ", t)
+                if prev_space:
+                    t = t.lstrip(" ")
+                if t:
+                    clean.append((s, t))
+                    prev_space = t.endswith(" ")
+            parts = clean
             for s, t in parts:
                 if not t:
                     continue

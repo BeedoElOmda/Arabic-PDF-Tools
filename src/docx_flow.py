@@ -131,6 +131,15 @@ def _container(g, rects):
     return best[1] if best else None
 
 
+def _rtl_key(g):
+    """Right-to-left visual order. A space whose origin is on its right edge was
+    drawn from the end of the previous letter: it comes after that letter."""
+    x1 = g["x1"]
+    if not g["t"].strip() and g["x"] > (g["x0"] + x1) / 2:
+        x1 -= 0.3
+    return (-x1, -g["x"])
+
+
 def _place_spaces(gs):
     """Some PDFs store a space glyph stretched back over the letter before it, so
     sorting by right edge puts it one letter too early. A space that clearly lies
@@ -201,7 +210,7 @@ def build_lines(glyphs, rects=(), split_gap=4.0):
     rows = merged
     lines = []
     for r in rows:
-        gs = _place_spaces(sorted(r["g"], key=lambda g: (-g["x1"], -g["x"])))
+        gs = _place_spaces(sorted(r["g"], key=_rtl_key))
         if rects:
             for g in gs:
                 g["box"] = _container(g, rects)
